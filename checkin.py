@@ -936,6 +936,7 @@ class CheckIn:
         cookies: dict,
         common_headers: dict,
         api_user: str | int,
+        impersonate: str | None = None,
     ) -> tuple[bool, dict]:
         """使用已有 cookies 执行签到操作
         
@@ -948,9 +949,10 @@ class CheckIn:
             f"ℹ️ {self.account_name}: Executing check-in with existing cookies (using proxy: {'true' if self.http_proxy_config else 'false'})"
         )
 
-        # 根据 User-Agent 自动推断 impersonate 值
+        # 根据 User-Agent 自动推断 impersonate 值（若调用方未显式传入）
         user_agent = common_headers.get("User-Agent", "")
-        impersonate = get_curl_cffi_impersonate(user_agent) if user_agent else "firefox135"
+        if not impersonate:
+            impersonate = get_curl_cffi_impersonate(user_agent) if user_agent else "firefox135"
         
         session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
         if impersonate:
