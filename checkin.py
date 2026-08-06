@@ -4,22 +4,30 @@ CheckIn 类
 """
 
 import asyncio
-import json
-import inspect
 import hashlib
+import inspect
+import json
 import os
 import tempfile
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlencode, urlparse
 
-from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
+from curl_cffi import requests as curl_requests
+
+from utils.browser_utils import (
+    aliyun_captcha_check,
+    filter_cookies,
+    get_random_user_agent,
+    parse_cookies,
+    take_screenshot,
+)
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
-from utils.http_utils import proxy_resolve, response_resolve
-from utils.topup import topup
 from utils.get_headers import get_browser_headers, get_curl_cffi_impersonate, print_browser_headers
+from utils.http_utils import proxy_resolve, response_resolve
 from utils.mask_utils import mask_username
+from utils.topup import topup
+
 
 class CheckIn:
     """newapi.ai 签到管理类"""
@@ -94,11 +102,11 @@ class CheckIn:
                     cookies = await browser.cookies()
 
                     waf_cookies = {}
-                    print(f"ℹ️ {self.account_name}: WAF cookies")
+                    print(f"ℹ️ {self.account_name}: WAF cookie names")
                     for cookie in cookies:
                         cookie_name = cookie.get("name")
                         cookie_value = cookie.get("value")
-                        print(f"  📚 Cookie: {cookie_name} (value: {cookie_value})")
+                        print(f"  📚 Cookie: {cookie_name}")
                         if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2"] and cookie_value is not None:
                             waf_cookies[cookie_name] = cookie_value
 
@@ -261,7 +269,7 @@ class CheckIn:
                     for cookie in cookies:
                         cookie_name = cookie.get("name")
                         cookie_value = cookie.get("value")
-                        print(f"  📚 Cookie: {cookie_name} (value: {cookie_value})")
+                        print(f"  📚 Cookie: {cookie_name}")
                         # if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
                         # and cookie_value is not None:
                         aliyun_captcha_cookies[cookie_name] = cookie_value
@@ -776,6 +784,12 @@ class CheckIn:
                 check_in_data = json_data.get("data", {})
                 checkin_date = check_in_data.get("checkin_date", "")
                 quota_awarded = check_in_data.get("quota_awarded", 0)
+                normalized_message = message.lower()
+                task_status = (
+                    "already_done"
+                    if "已经签到" in message or "已签到" in message or "already" in normalized_message
+                    else "success"
+                )
                 
                 if quota_awarded:
                     quota_display = round(quota_awarded / 500000, 2)
@@ -787,6 +801,7 @@ class CheckIn:
                     "success": True,
                     "message": message or "Check-in successful",
                     "data": check_in_data,
+                    "task_status": task_status,
                 }
             else:
                 error_msg = json_data.get("msg", json_data.get("message", "Unknown error"))
@@ -826,6 +841,7 @@ class CheckIn:
                 "success": True,
                 "topup_count": 0,
                 "topup_success_count": 0,
+                "task_status": "success",
                 "error": "",
             }
 
@@ -841,6 +857,7 @@ class CheckIn:
             "success": True,
             "topup_count": 0,
             "topup_success_count": 0,
+            "task_status": "success",
             "error": "",
         }
 
@@ -848,6 +865,7 @@ class CheckIn:
         cdk_generator = self.provider_config.get_cdk(self.account_config)
         
         topup_count = 0
+        task_result_count = 0
         error_msg = ""
 
         # 内部函数：处理单个 CDK 结果
@@ -861,12 +879,14 @@ class CheckIn:
             Returns:
                 bool: True 继续处理下一个，False 停止处理
             """
-            nonlocal topup_count, error_msg
+            nonlocal topup_count, task_result_count, error_msg
+            task_result_count += 1
             
             # 如果获取 CDK 失败，停止处理
             if not success:
                 error_msg = data.get("error", "Failed to get CDK")
                 results["success"] = False
+                results["task_status"] = "failed"
                 results["error"] = error_msg
                 print(f"❌ {self.account_name}: Failed to get CDK - {error_msg}, stopping topup process")
                 return False
@@ -876,6 +896,7 @@ class CheckIn:
             
             # 如果 code 为空，表示不需要充值，继续处理下一个
             if not cdk:
+                results["task_status"] = data.get("task_status", "already_done")
                 print(f"ℹ️ {self.account_name}: No CDK to topup (code is empty), continuing...")
                 return True
             
@@ -885,7 +906,7 @@ class CheckIn:
                 await asyncio.sleep(topup_interval)
 
             topup_count += 1
-            print(f"💰 {self.account_name}: Executing topup #{topup_count} with CDK: {cdk}")
+            print(f"💰 {self.account_name}: Executing topup #{topup_count}")
 
             topup_result = topup(
                 provider_config=self.provider_config,
@@ -899,6 +920,7 @@ class CheckIn:
 
             if topup_result.get("success"):
                 results["topup_success_count"] += 1
+                results["task_status"] = data.get("task_status", "success")
                 if not topup_result.get("already_used"):
                     print(f"✅ {self.account_name}: Topup #{topup_count} successful")
                 return True  # 继续处理下一个
@@ -906,6 +928,7 @@ class CheckIn:
                 # topup 失败，记录错误并停止
                 error_msg = topup_result.get("error", "Topup failed")
                 results["success"] = False
+                results["task_status"] = "failed"
                 results["error"] = error_msg
                 print(f"❌ {self.account_name}: Topup #{topup_count} failed, stopping topup process")
                 return False  # 停止处理
@@ -924,7 +947,12 @@ class CheckIn:
                 if not should_continue:
                     break
 
-        if topup_count == 0:
+        if task_result_count == 0:
+            results["success"] = False
+            results["task_status"] = "failed"
+            results["error"] = "Provider task returned no result"
+            print(f"❌ {self.account_name}: Provider task returned no result")
+        elif topup_count == 0:
             print(f"ℹ️ {self.account_name}: No CDK available for topup")
         elif results["topup_success_count"] > 0:
             print(f"✅ {self.account_name}: Total {results['topup_success_count']}/{results['topup_count']} topup(s) successful")
@@ -959,10 +987,7 @@ class CheckIn:
             print(f"ℹ️ {self.account_name}: Using curl_cffi Session with impersonate={impersonate}")
         
         try:
-            # 打印 cookies 的键和值
-            print(f"ℹ️ {self.account_name}: Cookies to be used:")
-            for key, value in cookies.items():
-                print(f"  📚 {key}: {value[:50] if len(value) > 50 else value}{'...' if len(value) > 50 else ''}")
+            print(f"ℹ️ {self.account_name}: Cookie names: {sorted(cookies.keys())}")
             session.cookies.update(cookies)
 
             # 使用传入的公用请求头，并添加动态头部
@@ -970,6 +995,8 @@ class CheckIn:
             headers[self.provider_config.api_user_key] = f"{api_user}"
             headers["Referer"] = self.provider_config.get_login_url()
             headers["Origin"] = self.provider_config.origin
+
+            task_status = "success"
 
             # 检查是否需要手动签到
             if self.provider_config.needs_manual_check_in():
@@ -984,11 +1011,13 @@ class CheckIn:
                     )
                     if checked_in_today:
                         print(f"ℹ️ {self.account_name}: Already checked in today, skipping check-in")
+                        task_status = "already_done"
                     else:
                         # 未签到，执行签到
                         check_in_result = self.execute_check_in(session, headers, api_user)
                         if not check_in_result.get("success"):
                             return False, {"error": check_in_result.get("error", "Check-in failed")}
+                        task_status = check_in_result.get("task_status", "success")
                         # 签到成功后再次查询状态（显示最新状态）
                         check_in_status_func(
                             provider_config=self.provider_config,
@@ -1001,8 +1030,9 @@ class CheckIn:
                     check_in_result = self.execute_check_in(session, headers, api_user)
                     if not check_in_result.get("success"):
                         return False, {"error": check_in_result.get("error", "Check-in failed")}
+                    task_status = check_in_result.get("task_status", "success")
             else:
-                print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
+                print(f"ℹ️ {self.account_name}: No direct check-in endpoint; verifying the provider task")
 
             # 如果需要手动 topup（配置了 topup_path 和 get_cdk），执行 topup
             if self.provider_config.needs_manual_topup():
@@ -1017,11 +1047,13 @@ class CheckIn:
                     error_msg = topup_result.get("error") or "Topup failed"
                     print(f"❌ {self.account_name}: Topup failed, stopping check-in process")
                     return False, {"error": error_msg}
+                task_status = topup_result.get("task_status", "success")
 
             user_info = await self.get_user_info(session, headers)
             if user_info and user_info.get("success"):
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
+                user_info["task_status"] = task_status
                 return True, user_info
             elif user_info:
                 error_msg = user_info.get("error", "Unknown error")
@@ -1075,6 +1107,8 @@ class CheckIn:
             headers["Referer"] = self.provider_config.get_login_url()
             headers["Origin"] = self.provider_config.origin
 
+            task_status = "success"
+
             # 检查是否需要手动签到
             if self.provider_config.needs_manual_check_in():
                 # 如果配置了签到状态查询，先检查是否已签到
@@ -1088,11 +1122,13 @@ class CheckIn:
                     )
                     if checked_in_today:
                         print(f"ℹ️ {self.account_name}: Already checked in today, skipping check-in")
+                        task_status = "already_done"
                     else:
                         # 未签到，执行签到
                         check_in_result = self.execute_check_in(session, headers, api_user)
                         if not check_in_result.get("success"):
                             return False, {"error": check_in_result.get("error", "Check-in failed")}
+                        task_status = check_in_result.get("task_status", "success")
                         # 签到成功后再次查询状态（显示最新状态）
                         check_in_status_func(
                             provider_config=self.provider_config,
@@ -1105,8 +1141,9 @@ class CheckIn:
                     check_in_result = self.execute_check_in(session, headers, api_user)
                     if not check_in_result.get("success"):
                         return False, {"error": check_in_result.get("error", "Check-in failed")}
+                    task_status = check_in_result.get("task_status", "success")
             else:
-                print(f"ℹ️ {self.account_name}: Check-in completed automatically (triggered by user info request)")
+                print(f"ℹ️ {self.account_name}: No direct check-in endpoint; verifying the provider task")
 
             # 如果需要手动 topup（配置了 topup_path 和 get_cdk），执行 topup
             if self.provider_config.needs_manual_topup():
@@ -1121,11 +1158,13 @@ class CheckIn:
                     error_msg = topup_result.get("error") or "Topup failed"
                     print(f"❌ {self.account_name}: Topup failed, stopping check-in process")
                     return False, {"error": error_msg}
+                task_status = topup_result.get("task_status", "success")
 
             user_info = await self.get_user_info(session, headers)
             if user_info and user_info.get("success"):
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
+                user_info["task_status"] = task_status
                 return True, user_info
             elif user_info:
                 error_msg = user_info.get("error", "Unknown error")
@@ -1199,7 +1238,7 @@ class CheckIn:
                 headers=headers,
             )
             if auth_state_result and auth_state_result.get("success"):
-                print(f"ℹ️ {self.account_name}: Got auth state for GitHub: {auth_state_result['state']}")
+                print(f"ℹ️ {self.account_name}: Got auth state for GitHub")
             else:
                 error_msg = auth_state_result.get("error", "Unknown error")
                 print(f"❌ {self.account_name}: {error_msg}")
@@ -1246,7 +1285,7 @@ class CheckIn:
                 # 构建带参数的回调 URL
                 base_url = self.provider_config.get_github_auth_url()
                 callback_url = f"{base_url}?{urlencode(result_data, doseq=True)}"
-                print(f"ℹ️ {self.account_name}: Callback URL: {callback_url}")
+                print(f"ℹ️ {self.account_name}: Calling GitHub OAuth callback")
                 try:
                     # 将 Camoufox 格式的 cookies 转换为 curl_cffi 格式
                     auth_cookies_list = auth_state_result.get("cookies", [])
@@ -1268,7 +1307,7 @@ class CheckIn:
                             api_user = user_data.get("id")
 
                             if api_user:
-                                print(f"✅ {self.account_name}: Got api_user from callback: {api_user}")
+                                print(f"✅ {self.account_name}: Got api_user from callback")
 
                                 # 提取 cookies
                                 user_cookies = {}
@@ -1362,7 +1401,7 @@ class CheckIn:
                 headers=headers,
             )
             if auth_state_result and auth_state_result.get("success"):
-                print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
+                print(f"ℹ️ {self.account_name}: Got auth state for Linux.do")
             else:
                 error_msg = auth_state_result.get("error", "Unknown error")
                 print(f"❌ {self.account_name}: {error_msg}")
@@ -1409,7 +1448,7 @@ class CheckIn:
                 # 构建带参数的回调 URL
                 base_url = self.provider_config.get_linuxdo_auth_url()
                 callback_url = f"{base_url}?{urlencode(result_data, doseq=True)}"
-                print(f"ℹ️ {self.account_name}: Callback URL: {callback_url}")
+                print(f"ℹ️ {self.account_name}: Calling Linux.do OAuth callback")
                 try:
                     # 将 Camoufox 格式的 cookies 转换为 curl_cffi 格式
                     auth_cookies_list = auth_state_result.get("cookies", [])
@@ -1431,7 +1470,7 @@ class CheckIn:
                             api_user = user_data.get("id")
 
                             if api_user:
-                                print(f"✅ {self.account_name}: Got api_user from callback: {api_user}")
+                                print(f"✅ {self.account_name}: Got api_user from callback")
 
                                 # 提取 cookies
                                 user_cookies = {}
@@ -1703,7 +1742,7 @@ class CheckIn:
                 user_obj = json.loads(user_data)
                 api_user = user_obj.get("id")
                 if api_user is not None:
-                    print(f"✅ {self.account_name}: Got api user from localStorage: {api_user}")
+                    print(f"✅ {self.account_name}: Got api user from localStorage")
                     return api_user
         except Exception as e:
             print(f"⚠️ {self.account_name}: Error reading user from localStorage: {e}")
@@ -1727,7 +1766,7 @@ class CheckIn:
                     user_data = json_data.get("data", {})
                     api_user = user_data.get("id")
                     if api_user is not None:
-                        print(f"✅ {self.account_name}: Got api user from user-info API: {api_user}")
+                        print(f"✅ {self.account_name}: Got api user from user-info API")
                         return api_user
             print(f"⚠️ {self.account_name}: Unable to get api user from user-info API, HTTP {response.status_code}")
         except Exception as e:
@@ -2078,4 +2117,3 @@ class CheckIn:
 
         return results
 
-   

@@ -8,9 +8,12 @@ Cloudflare cf_clearance cookie 获取模块
 from __future__ import annotations
 
 import tempfile
+
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
+
 from utils.get_headers import get_browser_headers, print_browser_headers
+
 
 async def get_cf_clearance(
     url: str,
@@ -105,7 +108,7 @@ async def get_cf_clearance(
                 for cookie in cookies:
                     cookie_name = cookie.get("name")
                     cookie_value = cookie.get("value")
-                    print(f"  📚 Cookie: {cookie_name} (value: {cookie_value[:50] if cookie_value and len(cookie_value) > 50 else cookie_value}...)")
+                    print(f"  📚 Cookie: {cookie_name}")
                     if cookie_name in ["cf_clearance", "__cf_bm", "cf_chl_2", "cf_chl_prog"] and cookie_value is not None:
                         cf_cookies[cookie_name] = cookie_value
                 

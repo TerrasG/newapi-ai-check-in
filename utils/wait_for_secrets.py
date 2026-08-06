@@ -48,7 +48,7 @@ class WaitForSecrets:
             return None
 
         except Exception as e:
-            print(f"❌ Error getting OIDC token: {e}")
+            print(f"❌ Error getting OIDC token: {type(e).__name__}")
             return None
 
     def parse_data_from_environment(self) -> Optional[list[str]]:
@@ -128,7 +128,7 @@ class WaitForSecrets:
             put_response = curl_requests.put(api_url, headers=headers, json=secrets_metadata_payload, timeout=30)
 
             if put_response.status_code != 200:
-                print(f"❌ Failed to register secret request: HTTP {put_response.status_code}, {put_response.text}")
+                print(f"❌ Failed to register secret request: HTTP {put_response.status_code}")
                 return None
 
             print("✅ Secret request registered")
@@ -190,7 +190,10 @@ class WaitForSecrets:
                                     value = secret.get("Value")
                                     if name and value:
                                         secrets_data[name] = value
-                                print(f"✅ Secrets received: {secrets_data}")
+                                print(
+                                    f"✅ Secrets received: {len(secrets_data)} item(s): "
+                                    f"{sorted(secrets_data)}"
+                                )
                                 break
                         else:
                             print(f"  🔗 Visit this URL to input secrets: {secret_url}")
@@ -201,7 +204,7 @@ class WaitForSecrets:
                         try:
                             body = get_response.text
                             if body != "Token used before issued":
-                                print(f"Response: {body}")
+                                print(f"⚠️ Secret service returned HTTP {get_response.status_code}")
                                 break
                             # If "Token used before issued", continue polling
                         except Exception:
@@ -227,13 +230,13 @@ class WaitForSecrets:
                 if delete_response.status_code == 200:
                     print("✅ Secret cleared from datastore")
                 else:
-                    print(f"⚠️ Failed to clear secret: HTTP {delete_response.status_code}, {delete_response.text}")
+                    print(f"⚠️ Failed to clear secret: HTTP {delete_response.status_code}")
 
             except Exception as e:
-                print(f"⚠️ Error clearing secret: {e}")
+                print(f"⚠️ Error clearing secret: {type(e).__name__}")
 
             return secrets_data
 
         except Exception as e:
-            print(f"❌ Error in wait_for_secrets: {e}")
+            print(f"❌ Error in wait_for_secrets: {type(e).__name__}")
             return None

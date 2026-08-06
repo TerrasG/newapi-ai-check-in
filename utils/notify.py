@@ -51,6 +51,31 @@ class NotificationKit:
 	def telegram_chat_id(self):
 		return os.getenv('TELEGRAM_CHAT_ID')
 
+	def _post_json(self, service: str, url: str, data: dict):
+		response = curl_requests.post(url, json=data, timeout=30)
+		if response.status_code >= 400:
+			raise RuntimeError(f'{service} request failed: HTTP {response.status_code}')
+
+		try:
+			payload = response.json()
+		except ValueError:
+			if response.status_code == 204:
+				return
+			raise RuntimeError(f'{service} request returned non-JSON response')
+
+		if not isinstance(payload, dict):
+			raise RuntimeError(f'{service} request returned an invalid JSON payload')
+
+		error_message = payload.get('errmsg') or payload.get('message') or payload.get('msg') or payload.get('error')
+		if payload.get('ok') is False:
+			raise RuntimeError(f'{service} request failed: {error_message or "ok=false"}')
+		if payload.get('errcode') not in (None, 0):
+			raise RuntimeError(f'{service} request failed: {error_message or payload.get("errcode")}')
+		if payload.get('code') not in (None, 0, 200):
+			raise RuntimeError(f'{service} request failed: {error_message or payload.get("code")}')
+		if payload.get('ret') not in (None, 0, 1, 200):
+			raise RuntimeError(f'{service} request failed: {error_message or payload.get("ret")}')
+
 	def send_email(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text'):
 		if not self.email_user or not self.email_pass or not self.email_to:
 			raise ValueError('Email configuration not set')
@@ -72,21 +97,21 @@ class NotificationKit:
 			raise ValueError('PushPlus Token not configured')
 
 		data = {'token': self.pushplus_token, 'title': title, 'content': content, 'template': 'html'}
-		curl_requests.post('http://www.pushplus.plus/send', json=data, timeout=30)
+		self._post_json('PushPlus', 'http://www.pushplus.plus/send', data)
 
 	def send_serverPush(self, title: str, content: str):
 		if not self.server_push_key:
 			raise ValueError('Server Push key not configured')
 
 		data = {'title': title, 'desp': content}
-		curl_requests.post(f'https://sctapi.ftqq.com/{self.server_push_key}.send', json=data, timeout=30)
+		self._post_json('Server Push', f'https://sctapi.ftqq.com/{self.server_push_key}.send', data)
 
 	def send_dingtalk(self, title: str, content: str):
 		if not self.dingding_webhook:
 			raise ValueError('DingTalk Webhook not configured')
 
 		data = {'msgtype': 'text', 'text': {'content': f'{title}\n{content}'}}
-		curl_requests.post(self.dingding_webhook, json=data, timeout=30)
+		self._post_json('DingTalk', self.dingding_webhook, data)
 
 	def send_feishu(self, title: str, content: str):
 		if not self.feishu_webhook:
@@ -99,14 +124,14 @@ class NotificationKit:
 				'header': {'template': 'blue', 'title': {'content': title, 'tag': 'plain_text'}},
 			},
 		}
-		curl_requests.post(self.feishu_webhook, json=data, timeout=30)
+		self._post_json('Feishu', self.feishu_webhook, data)
 
 	def send_wecom(self, title: str, content: str):
 		if not self.weixin_webhook:
 			raise ValueError('WeChat Work Webhook not configured')
 
 		data = {'msgtype': 'text', 'text': {'content': f'{title}\n{content}'}}
-		curl_requests.post(self.weixin_webhook, json=data, timeout=30)
+		self._post_json('WeChat Work', self.weixin_webhook, data)
 
 	def send_telegram(self, title: str, content: str):
 		if not self.telegram_bot_token or not self.telegram_chat_id:
@@ -114,25 +139,41 @@ class NotificationKit:
 
 		text = f'*{title}*\n{content}'
 		data = {'chat_id': self.telegram_chat_id, 'text': text, 'parse_mode': 'Markdown'}
-		curl_requests.post(f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage', json=data, timeout=30)
+		self._post_json(
+			'Telegram',
+			f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage',
+			data,
+		)
 
-	def push_message(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text'):
+	def push_message(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text') -> dict[str, str]:
 		notifications = [
-			('Email', lambda: self.send_email(title, content, msg_type)),
-			('PushPlus', lambda: self.send_pushplus(title, content)),
-			('Server Push', lambda: self.send_serverPush(title, content)),
-			('DingTalk', lambda: self.send_dingtalk(title, content)),
-			('Feishu', lambda: self.send_feishu(title, content)),
-			('WeChat Work', lambda: self.send_wecom(title, content)),
-			('Telegram', lambda: self.send_telegram(title, content)),
+			('Email', bool(self.email_user and self.email_pass and self.email_to), lambda: self.send_email(title, content, msg_type)),
+			('PushPlus', bool(self.pushplus_token), lambda: self.send_pushplus(title, content)),
+			('Server Push', bool(self.server_push_key), lambda: self.send_serverPush(title, content)),
+			('DingTalk', bool(self.dingding_webhook), lambda: self.send_dingtalk(title, content)),
+			('Feishu', bool(self.feishu_webhook), lambda: self.send_feishu(title, content)),
+			('WeChat Work', bool(self.weixin_webhook), lambda: self.send_wecom(title, content)),
+			(
+				'Telegram',
+				bool(self.telegram_bot_token and self.telegram_chat_id),
+				lambda: self.send_telegram(title, content),
+			),
 		]
 
-		for name, func in notifications:
+		statuses = {}
+		for name, is_configured, func in notifications:
+			if not is_configured:
+				statuses[name] = 'not_configured'
+				continue
 			try:
 				func()
+				statuses[name] = 'sent'
 				print(f'🔹 [{name}]: Message push successful!')
 			except Exception as e:
-				print(f'🔸 [{name}]: Message push failed! Reason: {str(e)}')
+				statuses[name] = 'failed'
+				print(f'🔸 [{name}]: Message push failed! Reason: {type(e).__name__}')
+
+		return statuses
 
 
 notify = NotificationKit()
