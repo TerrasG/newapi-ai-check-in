@@ -1418,6 +1418,7 @@ class CheckIn:
                 provider_config=self.provider_config,
                 username=username,
                 password=password,
+                proxy=self.camoufox_proxy_config,
             )
 
             success, result_data, oauth_browser_headers = await linuxdo.signin(

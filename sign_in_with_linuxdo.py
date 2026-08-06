@@ -28,6 +28,7 @@ class LinuxDoSignIn:
         provider_config: ProviderConfig,
         username: str,
         password: str,
+        proxy: dict | None = None,
     ):
         """初始化
 
@@ -36,11 +37,13 @@ class LinuxDoSignIn:
             provider_config: 提供商配置
             username: Linux.do 用户名
             password: Linux.do 密码
+            proxy: 可选代理配置（传给 camoufox 浏览器）
         """
         self.account_name = account_name
         self.provider_config = provider_config
         self.username = username
         self.password = password
+        self.proxy = proxy
 
     async def signin(
         self,
@@ -64,31 +67,42 @@ class LinuxDoSignIn:
         print(f"ℹ️ {self.account_name}: Executing sign-in with Linux.do")
         print(f"ℹ️ {self.account_name}: Using Linux.do OAuth session cache")
 
+        ensure_storage_state_from_env(
+            cache_file_path,
+            self.account_name,
+            self.username,
+            env_name=STORAGE_STATE_ENV_NAME,
+        )
+
+        # 只有存在缓存 storage state 时才可能无头运行；否则首次登录必须弹窗手动完成。
+        has_cached_session = Path(cache_file_path).exists() if cache_file_path else False  # noqa: ASYNC240
+        if has_cached_session:
+            print(f"ℹ️ {self.account_name}: Found cache file, restore storage state (headless)")
+        else:
+            print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
+
         # 使用 Camoufox 启动浏览器
+        # 有缓存登录态时用 headless（服务器无 GUI 也能跑授权）；无缓存时弹窗供手动登录。
+        # 若配置了代理（服务器经 Tailscale 走本机 Clash），传给 camoufox 让浏览器也走代理。
+        camoufox_kwargs: dict = {}
+        if self.proxy:
+            # 只传 proxy 不启用 geoip：服务器内存小，geoip 加载易卡/OOM；
+            # geoip 数据库已就位，但不主动启用即不会加载。
+            camoufox_kwargs["proxy"] = self.proxy
         async with AsyncCamoufox(
             # persistent_context=True,
             # user_data_dir=tmp_dir,
-            headless=False,
+            headless=has_cached_session,
             humanize=True,
             locale="en-US",
             os="macos",  # 强制使用 macOS 指纹，避免跨平台指纹不一致问题
             config={
                 "forceScopeAccess": True,
             },
+            **camoufox_kwargs,
         ) as browser:
-            ensure_storage_state_from_env(
-                    cache_file_path,
-                    self.account_name,
-                    self.username,
-                    env_name=STORAGE_STATE_ENV_NAME,
-            )
-            
             # 只有在缓存文件存在时才加载 storage_state
             storage_state = cache_file_path if Path(cache_file_path).exists() else None  # noqa: ASYNC240
-            if storage_state:
-                print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
-            else:
-                print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
 
             context = await browser.new_context(storage_state=storage_state)
 
@@ -232,7 +246,9 @@ class LinuxDoSignIn:
 
                         if allow_btn_ele:
                             print(f"✅ {self.account_name}: Approve button found, proceeding to authorization")
-                            await allow_btn_ele.click()
+                            # 无头模式下普通 click 会等元素稳定/可见性检查，在代理+Cloudflare下易超时；
+                            # 用 force=True 直接点击（OAuth 回调 code 随跳转 URL 携带，无需等导航完成）。
+                            await allow_btn_ele.click(force=True, no_wait_after=True)
 
                             # 在等待重定向之前，先检查是否遇到 Cloudflare 挑战
                             try:
@@ -272,18 +288,23 @@ class LinuxDoSignIn:
                         await take_screenshot(page, "authorization_failed_bypass", self.account_name)
                         return False, {"error": "Linux.do authorization failed"}, None
 
-                    try:                  
-                        # 先检查是否已跳转到 /console/token（Cloudflare 挑战等待期间可能已完成跳转）
-                        console_token_pattern = f"**{self.provider_config.origin}/console/token**"
-                        try:
-                            await page.wait_for_url(console_token_pattern, timeout=3000)
-                            print(f"ℹ️ {self.account_name}: Already redirected to /console/token, skipping redirect_pattern wait")
-                        except Exception:
-                            # 未跳转到 /console/token，使用配置的 redirect_pattern 等待
-                            redirect_pattern = self.provider_config.get_linuxdo_auth_redirect_pattern()
-                            print(f"ℹ️ {self.account_name}: Waiting for redirect to: {redirect_pattern}")
-                            await page.wait_for_url(redirect_pattern, timeout=30000)
-                            await page.wait_for_timeout(5000)
+                    try:
+                        # 授权点击后给跳转一点启动时间，再轮询 URL（force-click 后跳转有延迟，
+                        # wait_for_url 的 commit 事件在代理下可能延迟触发导致误超时）
+                        redirect_pattern = self.provider_config.get_linuxdo_auth_redirect_pattern()
+                        print(f"ℹ️ {self.account_name}: Waiting for redirect to: {redirect_pattern}")
+                        redirected = False
+                        for _ in range(6):  # 最多 ~18s
+                            await page.wait_for_timeout(3000)
+                            current_url = page.url
+                            if current_url.startswith(self.provider_config.origin) or "code=" in current_url:
+                                redirected = True
+                                print(f"ℹ️ {self.account_name}: Redirected to: {current_url[:100]}")
+                                break
+                        if not redirected:
+                            # 兜底：用 wait_for_url 再试一次
+                            await page.wait_for_url(redirect_pattern, timeout=10000, wait_until="commit")
+                            await page.wait_for_timeout(2000)
 
                         # 检查是否在 Cloudflare 验证页面
                         page_title = await page.title()
