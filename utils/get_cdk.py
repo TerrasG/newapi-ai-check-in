@@ -296,8 +296,10 @@ async def _get_x666_user_token(
             if http_proxy:
                 proxy_args["proxy"] = {"server": http_proxy} if isinstance(http_proxy, str) else http_proxy
 
+        # 有缓存 storage state 时用 headless（服务器无 GUI 也能跑 auto-login）；无缓存时弹窗手动登录
+        has_cache = Path(cache_file_path).exists() or Path(linuxdo_cache_file_path).exists()  # noqa: ASYNC240
         async with AsyncCamoufox(
-            headless=False,
+            headless=has_cache,
             humanize=True,
             locale="en-US",
             os="macos",
@@ -355,7 +357,11 @@ async def _get_x666_user_token(
                 print(f"ℹ️ {account_name}: Got auth_url, navigating to Linux.do authorization page")
 
                 # Step 3: 导航到 connect.linux.do 授权页面
-                await page.goto(auth_result, wait_until="domcontentloaded")
+                try:
+                    await page.goto(auth_result, wait_until="domcontentloaded", timeout=60000)
+                except Exception as goto_err:
+                    # 授权页在 headless+代理下可能加载慢，超时后检查是否已在授权页/跳转
+                    print(f"⚠️ {account_name}: auth page goto slow ({type(goto_err).__name__}), continuing")
                 await page.wait_for_timeout(3000)
 
                 current_url = page.url
@@ -375,10 +381,10 @@ async def _get_x666_user_token(
                         await take_screenshot(page, "x666_linuxdo_session_expired", account_name)
                         return None
 
-                    # 点击授权按钮
+                    # 点击授权按钮（headless 下用 force，避免稳定性检查超时）
                     if allow_btn:
                         print(f"ℹ️ {account_name}: Clicking authorize button")
-                        await allow_btn.click()
+                        await allow_btn.click(force=True, no_wait_after=True)
                         await page.wait_for_timeout(5000)
 
                 # Step 4: 等待重定向回 up.x666.me
