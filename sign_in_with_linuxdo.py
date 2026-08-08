@@ -5,10 +5,13 @@
 
 import json
 import os
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
-from utils.browser_utils import filter_cookies, take_screenshot, save_page_content_to_file
+
+from utils.browser_utils import filter_cookies, save_page_content_to_file, take_screenshot
 from utils.config import ProviderConfig
 from utils.get_headers import get_browser_headers, print_browser_headers
 from utils.storage_state import ensure_storage_state_from_env
@@ -25,6 +28,7 @@ class LinuxDoSignIn:
         provider_config: ProviderConfig,
         username: str,
         password: str,
+        proxy: dict | None = None,
     ):
         """初始化
 
@@ -33,11 +37,13 @@ class LinuxDoSignIn:
             provider_config: 提供商配置
             username: Linux.do 用户名
             password: Linux.do 密码
+            proxy: 可选代理配置（传给 camoufox 浏览器）
         """
         self.account_name = account_name
         self.provider_config = provider_config
         self.username = username
         self.password = password
+        self.proxy = proxy
 
     async def signin(
         self,
@@ -59,35 +65,44 @@ class LinuxDoSignIn:
             - 浏览器指纹头部信息仅在检测到 Cloudflare 验证页面时返回
         """
         print(f"ℹ️ {self.account_name}: Executing sign-in with Linux.do")
-        print(
-            f"ℹ️ {self.account_name}: Using client_id: {client_id}, auth_state: {auth_state}, cache_file: {cache_file_path}"
+        print(f"ℹ️ {self.account_name}: Using Linux.do OAuth session cache")
+
+        ensure_storage_state_from_env(
+            cache_file_path,
+            self.account_name,
+            self.username,
+            env_name=STORAGE_STATE_ENV_NAME,
         )
 
+        # 只有存在缓存 storage state 时才可能无头运行；否则首次登录必须弹窗手动完成。
+        has_cached_session = Path(cache_file_path).exists() if cache_file_path else False  # noqa: ASYNC240
+        if has_cached_session:
+            print(f"ℹ️ {self.account_name}: Found cache file, restore storage state (headless)")
+        else:
+            print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
+
         # 使用 Camoufox 启动浏览器
+        # 有缓存登录态时用 headless（服务器无 GUI 也能跑授权）；无缓存时弹窗供手动登录。
+        # 若配置了代理（服务器经 Tailscale 走本机 Clash），传给 camoufox 让浏览器也走代理。
+        camoufox_kwargs: dict = {}
+        if self.proxy:
+            # 只传 proxy 不启用 geoip：服务器内存小，geoip 加载易卡/OOM；
+            # geoip 数据库已就位，但不主动启用即不会加载。
+            camoufox_kwargs["proxy"] = self.proxy
         async with AsyncCamoufox(
             # persistent_context=True,
             # user_data_dir=tmp_dir,
-            headless=False,
+            headless=has_cached_session,
             humanize=True,
             locale="en-US",
             os="macos",  # 强制使用 macOS 指纹，避免跨平台指纹不一致问题
             config={
                 "forceScopeAccess": True,
             },
+            **camoufox_kwargs,
         ) as browser:
-            ensure_storage_state_from_env(
-                    cache_file_path,
-                    self.account_name,
-                    self.username,
-                    env_name=STORAGE_STATE_ENV_NAME,
-            )
-            
             # 只有在缓存文件存在时才加载 storage_state
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
-            if storage_state:
-                print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
-            else:
-                print(f"ℹ️ {self.account_name}: No cache file found, starting fresh")
+            storage_state = cache_file_path if Path(cache_file_path).exists() else None  # noqa: ASYNC240
 
             context = await browser.new_context(storage_state=storage_state)
 
@@ -99,6 +114,7 @@ class LinuxDoSignIn:
                 print(f"ℹ️ {self.account_name}: No auth cookies to set")
 
             page = await context.new_page()
+            cloudflare_challenge_detected = False
 
             async with ClickSolver(
                 framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
@@ -112,9 +128,9 @@ class LinuxDoSignIn:
                         f"response_type=code&client_id={client_id}&state={auth_state}"
                     )
 
-                    if os.path.exists(cache_file_path):
+                    if Path(cache_file_path).exists():  # noqa: ASYNC240
                         try:
-                            print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
+                            print(f"ℹ️ {self.account_name}: Checking cached Linux.do login status")
                             # 直接访问授权页面检查是否已登录
                             response = await page.goto(oauth_url, wait_until="domcontentloaded")
                             print(
@@ -166,6 +182,7 @@ class LinuxDoSignIn:
                             page_content = await page.content()
 
                             if "Just a moment" in page_title or "Checking your browser" in page_content:
+                                cloudflare_challenge_detected = True
                                 print(f"ℹ️ {self.account_name}: Cloudflare challenge detected, auto-solving...")
                                 try:
                                     await solver.solve_captcha(
@@ -189,6 +206,7 @@ class LinuxDoSignIn:
                                 current_url = page.url
                                 print(f"ℹ️ {self.account_name}: Current page url is {current_url}")
                                 if "linux.do/challenge" in current_url:
+                                    cloudflare_challenge_detected = True
                                     print(
                                         f"⚠️ {self.account_name}: Cloudflare challenge detected, "
                                         "Camoufox should bypass it automatically. Waiting..."
@@ -213,7 +231,7 @@ class LinuxDoSignIn:
 
                         # 登录后访问授权页面
                         try:
-                            print(f"ℹ️ {self.account_name}: Navigating to authorization page: {oauth_url}")
+                            print(f"ℹ️ {self.account_name}: Navigating to Linux.do authorization page")
                             await page.goto(oauth_url, wait_until="domcontentloaded")
                         except Exception as e:
                             print(f"❌ {self.account_name}: Failed to navigate to authorization page: {e}")
@@ -228,7 +246,9 @@ class LinuxDoSignIn:
 
                         if allow_btn_ele:
                             print(f"✅ {self.account_name}: Approve button found, proceeding to authorization")
-                            await allow_btn_ele.click()
+                            # 无头模式下普通 click 会等元素稳定/可见性检查，在代理+Cloudflare下易超时；
+                            # 用 force=True 直接点击（OAuth 回调 code 随跳转 URL 携带，无需等导航完成）。
+                            await allow_btn_ele.click(force=True, no_wait_after=True)
 
                             # 在等待重定向之前，先检查是否遇到 Cloudflare 挑战
                             try:
@@ -268,22 +288,23 @@ class LinuxDoSignIn:
                         await take_screenshot(page, "authorization_failed_bypass", self.account_name)
                         return False, {"error": "Linux.do authorization failed"}, None
 
-                    # 统一处理授权逻辑（无论是否通过缓存登录）
-                    # 标记是否检测到 Cloudflare 验证页面
-                    cloudflare_challenge_detected = False
-
-                    try:                  
-                        # 先检查是否已跳转到 /console/token（Cloudflare 挑战等待期间可能已完成跳转）
-                        console_token_pattern = f"**{self.provider_config.origin}/console/token**"
-                        try:
-                            await page.wait_for_url(console_token_pattern, timeout=3000)
-                            print(f"ℹ️ {self.account_name}: Already redirected to /console/token, skipping redirect_pattern wait")
-                        except Exception:
-                            # 未跳转到 /console/token，使用配置的 redirect_pattern 等待
-                            redirect_pattern = self.provider_config.get_linuxdo_auth_redirect_pattern()
-                            print(f"ℹ️ {self.account_name}: Waiting for redirect to: {redirect_pattern}")
-                            await page.wait_for_url(redirect_pattern, timeout=30000)
-                            await page.wait_for_timeout(5000)
+                    try:
+                        # 授权点击后给跳转一点启动时间，再轮询 URL（force-click 后跳转有延迟，
+                        # wait_for_url 的 commit 事件在代理下可能延迟触发导致误超时）
+                        redirect_pattern = self.provider_config.get_linuxdo_auth_redirect_pattern()
+                        print(f"ℹ️ {self.account_name}: Waiting for redirect to: {redirect_pattern}")
+                        redirected = False
+                        for _ in range(6):  # 最多 ~18s
+                            await page.wait_for_timeout(3000)
+                            current_url = page.url
+                            if current_url.startswith(self.provider_config.origin) or "code=" in current_url:
+                                redirected = True
+                                print(f"ℹ️ {self.account_name}: Redirected to: {current_url[:100]}")
+                                break
+                        if not redirected:
+                            # 兜底：用 wait_for_url 再试一次
+                            await page.wait_for_url(redirect_pattern, timeout=10000, wait_until="commit")
+                            await page.wait_for_timeout(2000)
 
                         # 检查是否在 Cloudflare 验证页面
                         page_title = await page.title()
@@ -325,7 +346,7 @@ class LinuxDoSignIn:
                             user_obj = json.loads(user_data)
                             api_user = user_obj.get("id")
                             if api_user:
-                                print(f"✅ {self.account_name}: Got api user: {api_user}")
+                                print(f"✅ {self.account_name}: Got api user")
                             else:
                                 print(f"⚠️ {self.account_name}: User id not found in localStorage")
                         else:
@@ -364,7 +385,7 @@ class LinuxDoSignIn:
 
                         # 如果 query 中包含 code，说明 OAuth 回调成功
                         if "code" in query_params:
-                            print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
+                            print(f"✅ {self.account_name}: OAuth code received")
                             # 只有当检测到 Cloudflare 验证页面时，才获取并返回浏览器指纹头部信息
                             browser_headers = None
                             if cloudflare_challenge_detected:

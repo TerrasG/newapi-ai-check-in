@@ -13,18 +13,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import time
-from typing import TYPE_CHECKING, Generator, AsyncGenerator
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from typing import TYPE_CHECKING, AsyncGenerator, Generator
+from urllib.parse import parse_qs, urlparse
 
 from camoufox.async_api import AsyncCamoufox
 from curl_cffi import requests as curl_requests
 
-from utils.browser_utils import take_screenshot, save_page_content_to_file
-from utils.http_utils import proxy_resolve, response_resolve
-from utils.get_headers import get_curl_cffi_impersonate
+from utils.browser_utils import take_screenshot
 from utils.get_cf_clearance import get_cf_clearance
+from utils.get_headers import get_curl_cffi_impersonate
+from utils.http_utils import proxy_resolve, response_resolve
+from utils.storage_state import ensure_storage_state_from_env
 
 if TYPE_CHECKING:
     from utils.config import AccountConfig
@@ -128,7 +129,7 @@ def get_runawaytime_cdk(
                         if json_data.get("success"):
                             code = json_data.get("code", "")
                             if code:
-                                print(f"✅ {account_name}: Checkin successful! Code: {code}")
+                                print(f"✅ {account_name}: Checkin successful")
                                 yield True, {"code": code}
                         else:
                             message = json_data.get("message", json_data.get("msg", ""))
@@ -199,9 +200,7 @@ def get_runawaytime_cdk(
                             remaining = json_data.get("remaining", remaining - 1)
                             if code:
                                 spin_count += 1
-                                print(
-                                    f"✅ {account_name}: Wheel spin #{spin_count} successful! Code: {code}, remaining: {remaining}"
-                                )
+                                print(f"✅ {account_name}: Wheel spin #{spin_count} successful, remaining: {remaining}")
                                 yield True, {"code": code}
                                 continue
 
@@ -230,7 +229,9 @@ def get_runawaytime_cdk(
 
 
 async def _get_x666_user_token(
-    account_name: str, username: str, password: str, proxy_config=None
+    account_name: str,
+    username: str,
+    proxy_config=None,
 ) -> str | None:
     """通过 Linux.do OAuth 自动登录 up.x666.me 获取 userToken
 
@@ -238,14 +239,13 @@ async def _get_x666_user_token(
     1. 启动 Camoufox 浏览器
     2. 导航到 up.x666.me，检查 localStorage 是否已有 userToken
     3. 如果没有，调用 /api/auth/login 获取 auth_url
-    4. 导航到 connect.linux.do 授权页面，登录并授权
+    4. 复用共享 Linux.do storage state 完成授权
     5. 等待重定向回 up.x666.me/?token=JWT_TOKEN
     6. 从 URL 参数或 localStorage 提取 userToken
 
     Args:
         account_name: 账号名称（用于日志）
         username: Linux.do 用户名
-        password: Linux.do 密码
         proxy_config: 代理配置
 
     Returns:
@@ -265,7 +265,7 @@ async def _get_x666_user_token(
             if padding != 4:
                 payload_b64 += '=' * padding
 
-            payload = json.loads(base64.b64decode(payload_b64))
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
             exp = payload.get('exp')
 
             if not exp:
@@ -278,6 +278,14 @@ async def _get_x666_user_token(
 
     username_hash = hashlib.sha256(username.encode()).hexdigest()[:8]
     cache_file_path = f"storage-states/x666_up_{username_hash}.json"
+    linuxdo_cache_file_path = f"storage-states/linuxdo_{username_hash}_storage_state.json"
+
+    ensure_storage_state_from_env(
+        linuxdo_cache_file_path,
+        account_name,
+        username,
+        env_name="STORATE_STATES_LINUXDO",
+    )
 
     print(f"ℹ️ {account_name}: Attempting auto-login to up.x666.me via Linux.do")
 
@@ -288,19 +296,25 @@ async def _get_x666_user_token(
             if http_proxy:
                 proxy_args["proxy"] = {"server": http_proxy} if isinstance(http_proxy, str) else http_proxy
 
+        # 有缓存 storage state 时用 headless（服务器无 GUI 也能跑 auto-login）；无缓存时弹窗手动登录
+        has_cache = Path(cache_file_path).exists() or Path(linuxdo_cache_file_path).exists()  # noqa: ASYNC240
         async with AsyncCamoufox(
-            headless=False,
+            headless=has_cache,
             humanize=True,
             locale="en-US",
             os="macos",
             config={"forceScopeAccess": True},
             **proxy_args,
         ) as browser:
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
-            if storage_state:
+            if Path(cache_file_path).exists():  # noqa: ASYNC240 - local state check is immediate and bounded
+                storage_state = cache_file_path
                 print(f"ℹ️ {account_name}: Found x666 cache file, restoring storage state")
+            elif Path(linuxdo_cache_file_path).exists():  # noqa: ASYNC240 - local state check is immediate and bounded
+                storage_state = linuxdo_cache_file_path
+                print(f"ℹ️ {account_name}: Reusing shared Linux.do storage state for x666")
             else:
-                print(f"ℹ️ {account_name}: No x666 cache file found, starting fresh")
+                storage_state = None
+                print(f"⚠️ {account_name}: No reusable Linux.do storage state found for x666")
 
             context = await browser.new_context(storage_state=storage_state)
             page = await context.new_page()
@@ -343,7 +357,11 @@ async def _get_x666_user_token(
                 print(f"ℹ️ {account_name}: Got auth_url, navigating to Linux.do authorization page")
 
                 # Step 3: 导航到 connect.linux.do 授权页面
-                await page.goto(auth_result, wait_until="domcontentloaded")
+                try:
+                    await page.goto(auth_result, wait_until="domcontentloaded", timeout=60000)
+                except Exception as goto_err:
+                    # 授权页在 headless+代理下可能加载慢，超时后检查是否已在授权页/跳转
+                    print(f"⚠️ {account_name}: auth page goto slow ({type(goto_err).__name__}), continuing")
                 await page.wait_for_timeout(3000)
 
                 current_url = page.url
@@ -356,48 +374,17 @@ async def _get_x666_user_token(
                     allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
 
                     if not allow_btn:
-                        # 未登录，需要填写用户名密码
-                        print(f"ℹ️ {account_name}: Not logged in to Linux.do, performing login")
+                        print(
+                            f"❌ {account_name}: Shared Linux.do session is expired; "
+                            "refresh STORATE_STATES_LINUXDO before retrying"
+                        )
+                        await take_screenshot(page, "x666_linuxdo_session_expired", account_name)
+                        return None
 
-                        # 如果在 linux.do 登录页面
-                        if "linux.do" in current_url:
-                            # 可能需要先去登录页面
-                            if "/login" not in current_url:
-                                await page.goto("https://linux.do/login", wait_until="domcontentloaded")
-                                await page.wait_for_timeout(3000)
-
-                            await page.fill("#login-account-name", username)
-                            await page.wait_for_timeout(2000)
-                            await page.fill("#login-account-password", password)
-                            await page.wait_for_timeout(2000)
-                            await page.click("#login-button")
-                            await page.wait_for_timeout(10000)
-
-                            await save_page_content_to_file(
-                                page, "x666_linuxdo_login_result", account_name, prefix="x666"
-                            )
-
-                            # 登录后重新访问授权页面
-                            await page.goto(auth_result, wait_until="domcontentloaded")
-                            await page.wait_for_timeout(3000)
-                        else:
-                            # 在 connect.linux.do 页面但需要登录
-                            login_form = await page.query_selector("#login-account-name")
-                            if login_form:
-                                await page.fill("#login-account-name", username)
-                                await page.wait_for_timeout(2000)
-                                await page.fill("#login-account-password", password)
-                                await page.wait_for_timeout(2000)
-                                await page.click("#login-button")
-                                await page.wait_for_timeout(10000)
-
-                        # 再次检查授权按钮
-                        allow_btn = await page.query_selector('a[href^="/oauth2/approve"]')
-
-                    # 点击授权按钮
+                    # 点击授权按钮（headless 下用 force，避免稳定性检查超时）
                     if allow_btn:
                         print(f"ℹ️ {account_name}: Clicking authorize button")
-                        await allow_btn.click()
+                        await allow_btn.click(force=True, no_wait_after=True)
                         await page.wait_for_timeout(5000)
 
                 # Step 4: 等待重定向回 up.x666.me
@@ -411,13 +398,15 @@ async def _get_x666_user_token(
 
                 # Step 5: 从 URL 参数提取 token
                 user_token = None
-                if "token=" in current_url:
-                    parsed = urlparse(current_url)
+                parsed = urlparse(current_url)
+                if parsed.hostname == "up.x666.me" and "token=" in current_url:
                     params = parse_qs(parsed.query)
                     token_list = params.get("token", [])
                     if token_list:
                         user_token = token_list[0]
                         print(f"✅ {account_name}: Got userToken from URL parameter")
+                elif "token=" in current_url:
+                    print(f"⚠️ {account_name}: Ignoring token from unexpected OAuth callback host")
 
                 # 如果 URL 中没有，尝试从 localStorage 获取
                 if not user_token:
@@ -428,6 +417,22 @@ async def _get_x666_user_token(
                             print(f"✅ {account_name}: Got userToken from localStorage")
                     except Exception:
                         pass
+
+                # up.x666.me 的 token 实际存在 HttpOnly cookie `auth_token`（JWT），
+                # localStorage 读不到（HttpOnly），这里从 cookie 兜底读取。
+                if not user_token:
+                    try:
+                        cookies = await context.cookies()
+                        auth_token = next(
+                            (c["value"] for c in cookies
+                             if c["name"] == "auth_token" and "up.x666.me" in c.get("domain", "")),
+                            None,
+                        )
+                        if auth_token:
+                            user_token = auth_token
+                            print(f"✅ {account_name}: Got userToken from auth_token cookie")
+                    except Exception as exc:
+                        print(f"⚠️ {account_name}: Failed to read auth_token cookie: {type(exc).__name__}")
 
                 if user_token:
                     # 保存 storage_state 用于下次缓存
@@ -482,7 +487,9 @@ async def get_x666_cdk(
         if linux_do_accounts and isinstance(linux_do_accounts, list) and len(linux_do_accounts) > 0:
             ld_account = linux_do_accounts[0]
             access_token = await _get_x666_user_token(
-                account_name, ld_account.username, ld_account.password, proxy_config
+                account_name,
+                ld_account.username,
+                proxy_config,
             )
         else:
             print(f"❌ {account_name}: No access_token and no linux.do accounts configured")
@@ -538,16 +545,20 @@ async def get_x666_cdk(
                 if status_data and status_data.get("success"):
                     # API 响应格式：can_spin 和 today_record 直接在顶层
                     # {"success":true,"can_spin":false,"today_record":{...},"total_quota":...}
-                    can_spin = status_data.get("can_spin", False)
+                    can_spin = status_data.get("can_spin")
+                    if not isinstance(can_spin, bool):
+                        print(f"❌ {account_name}: Check-in status missing boolean can_spin")
+                        yield False, {"error": "Invalid check-in status response"}
+                        return
 
                     if not can_spin:
                         # 今天已经抽过，显示今日奖励
-                        today_record = status_data.get("today_record")
+                        today_record = status_data.get("today_record") or {}
                         today_quota = today_record.get("quota_amount", 0)
                         today_quota_display = round(today_quota / 500, 2)
                         print(f"✅ {account_name}: Already spun today, today's prize: {today_quota_display}")
                         # 已经抽过，返回成功但 code 为空表示不需要充值
-                        yield True, {"code": ""}
+                        yield True, {"code": "", "task_status": "already_done"}
                         return
                 else:
                     error_msg = status_data.get("message", "Unknown error") if status_data else "Invalid response"
@@ -592,14 +603,14 @@ async def get_x666_cdk(
                     
                     print(f"✅ {account_name}: Spin successful! {message}")
                     # 成功，返回空 code 表示不需要充值（奖励已直接充值到账户）
-                    yield True, {"code": ""}
+                    yield True, {"code": "", "task_status": "success"}
                     return
 
                 message = json_data.get("message", json_data.get("msg", ""))
                 if "already" in message.lower() or "已签到" in message:
                     print(f"✅ {account_name}: Already spun today, {message}")
                     # 已经抽过，返回成功但 code 为空
-                    yield True, {"code": ""}
+                    yield True, {"code": "", "task_status": "already_done"}
                     return
 
                 print(f"❌ {account_name}: Spin failed - {message}")
@@ -738,7 +749,7 @@ async def get_b4u_cdk(
                 # 解析响应，格式如: 0:["$@1",["xxx",null]]\n1:1
                 # 其中 "1:N" 的 N 表示剩余抽奖次数
                 response_text = status_response.text
-                print(f"ℹ️ {account_name}: Luckydraw status response: {response_text[:200]}")
+                print(f"ℹ️ {account_name}: Luckydraw status response received (HTTP {status_response.status_code})")
 
                 # 解析剩余次数
                 lines = response_text.strip().split("\n")
@@ -779,7 +790,10 @@ async def get_b4u_cdk(
 
                 if response.status_code == 200:
                     response_text = response.text
-                    print(f"ℹ️ {account_name}: Luckydraw response #{draw_count + 1}: {response_text[:300]}")
+                    print(
+                        f"ℹ️ {account_name}: Luckydraw response #{draw_count + 1} "
+                        f"received (HTTP {response.status_code})"
+                    )
 
                     # 解析响应，格式如:
                     # 0:["$@1",["xxx",null]]
@@ -804,7 +818,8 @@ async def get_b4u_cdk(
                                             draw_count += 1
                                             remaining -= 1
                                             print(
-                                                f"✅ {account_name}: Luckydraw #{draw_count} successful! Prize: {prize_name}, Code: {redemption_code}, remaining: {remaining}"
+                                                f"✅ {account_name}: Luckydraw #{draw_count} successful! "
+                                                f"Prize: {prize_name}, remaining: {remaining}"
                                             )
                                             yield True, {"code": redemption_code}
                                         else:

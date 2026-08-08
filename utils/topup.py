@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING
 
 from curl_cffi import requests as curl_requests
 
-from utils.http_utils import proxy_resolve, response_resolve
 from utils.get_headers import get_curl_cffi_impersonate
+from utils.http_utils import proxy_resolve, response_resolve
 
 if TYPE_CHECKING:
     from utils.config import AccountConfig, ProviderConfig
@@ -103,19 +103,19 @@ def topup(
                 print(f"❌ {account_name}: Topup failed - {error_msg}")
                 return {
                     "success": False,
-                    "error": f"Topup failed: {error_msg}(key: {key})",
+                    "error": f"Topup failed: {error_msg}",
                 }
         else:
             print(f"❌ {account_name}: Topup failed - HTTP {response.status_code}")
             return {
                 "success": False,
-                "error": f"Topup failed: HTTP {response.status_code}(key: {key})",
+                "error": f"Topup failed: HTTP {response.status_code}",
             }
     except Exception as e:
         print(f"❌ {account_name}: Topup error - {e}")
         return {
             "success": False,
-            "error": f"Topup failed: {e}(key: {key})",
+            "error": f"Topup failed: {e}",
         }
     finally:
         session.close()

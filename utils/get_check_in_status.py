@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 
 from curl_cffi import requests as curl_requests
 
-from utils.http_utils import proxy_resolve, response_resolve
 from utils.get_headers import get_curl_cffi_impersonate
+from utils.http_utils import proxy_resolve, response_resolve
 
 if TYPE_CHECKING:
     from utils.config import AccountConfig, ProviderConfig

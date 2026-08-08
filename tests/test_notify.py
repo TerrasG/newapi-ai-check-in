@@ -1,105 +1,102 @@
-import os
-import sys
-from datetime import datetime
-from pathlib import Path
+import smtplib
 from unittest.mock import MagicMock, patch
 
 import pytest
-from dotenv import load_dotenv
-
-# 添加项目根目录到 PATH
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-load_dotenv(project_root / '.env')
 
 from utils.notify import NotificationKit
 
 
-@pytest.fixture
-def notification_kit():
-	return NotificationKit()
+@pytest.fixture(autouse=True)
+def clear_notification_environment(monkeypatch):
+	for name in (
+		'EMAIL_USER',
+		'EMAIL_PASS',
+		'EMAIL_TO',
+		'CUSTOM_SMTP_SERVER',
+		'PUSHPLUS_TOKEN',
+		'SERVERPUSHKEY',
+		'DINGDING_WEBHOOK',
+		'FEISHU_WEBHOOK',
+		'WEIXIN_WEBHOOK',
+		'TELEGRAM_BOT_TOKEN',
+		'TELEGRAM_CHAT_ID',
+	):
+		monkeypatch.delenv(name, raising=False)
 
 
-def test_real_notification(notification_kit):
-	"""真实接口测试，需要配置.env.local文件"""
-	if os.getenv('ENABLE_REAL_TEST') != 'true':
-		pytest.skip('未启用真实接口测试')
+def test_send_email_uses_configured_smtp(monkeypatch):
+	monkeypatch.setenv('EMAIL_USER', 'sender@example.com')
+	monkeypatch.setenv('EMAIL_PASS', 'smtp-token')
+	monkeypatch.setenv('EMAIL_TO', 'recipient@example.com')
+	monkeypatch.setenv('CUSTOM_SMTP_SERVER', 'smtp.example.com')
+	smtp_server = MagicMock()
 
-	notification_kit.push_message(
-		'测试消息', f'这是一条测试消息\n发送时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+	with patch('utils.notify.smtplib.SMTP_SSL', return_value=smtp_server):
+		NotificationKit().send_email('subject', 'content')
+
+	smtp_server.__enter__.return_value.login.assert_called_once_with(
+		'sender@example.com',
+		'smtp-token',
 	)
+	smtp_server.__enter__.return_value.send_message.assert_called_once()
 
 
-@patch('smtplib.SMTP_SSL')
-def test_send_email(mock_smtp, notification_kit):
-	mock_server = MagicMock()
-	mock_smtp.return_value.__enter__.return_value = mock_server
+def test_send_email_reports_missing_configuration(monkeypatch):
+	monkeypatch.delenv('EMAIL_USER', raising=False)
+	monkeypatch.delenv('EMAIL_PASS', raising=False)
+	monkeypatch.delenv('EMAIL_TO', raising=False)
 
-	notification_kit.send_email('测试标题', '测试内容')
-
-	assert mock_server.login.called
-	assert mock_server.send_message.called
-
-
-@patch('requests.post')
-def test_send_pushplus(mock_post, notification_kit):
-	notification_kit.send_pushplus('测试标题', '测试内容')
-
-	mock_post.assert_called_once()
-	args = mock_post.call_args[1]
-	assert 'test_token' in str(args)
+	try:
+		NotificationKit().send_email('subject', 'content')
+	except ValueError as error:
+		assert str(error) == 'Email configuration not set'
+	else:
+		raise AssertionError('send_email must reject missing configuration')
 
 
-@patch('requests.post')
-def test_send_dingtalk(mock_post, notification_kit):
-	notification_kit.send_dingtalk('测试标题', '测试内容')
+def test_push_message_reports_channel_statuses(monkeypatch):
+	monkeypatch.setenv('EMAIL_USER', 'sender@example.com')
+	monkeypatch.setenv('EMAIL_PASS', 'smtp-token')
+	monkeypatch.setenv('EMAIL_TO', 'recipient@example.com')
 
-	expected_webhook = 'https://oapi.dingtalk.com/robot/send?access_token=fbcd45f32f17dea5c762e82644c7f28945075e0b4d22953c8eebe064b106a96f'
-	expected_data = {'msgtype': 'text', 'text': {'content': '测试标题\n测试内容'}}
+	with patch(
+		'utils.notify.smtplib.SMTP_SSL',
+		side_effect=smtplib.SMTPException('smtp unavailable'),
+	):
+		statuses = NotificationKit().push_message('subject', 'content')
 
-	mock_post.assert_called_once_with(expected_webhook, json=expected_data)
-
-
-@patch('requests.post')
-def test_send_feishu(mock_post, notification_kit):
-	notification_kit.send_feishu('测试标题', '测试内容')
-
-	mock_post.assert_called_once()
-	args = mock_post.call_args[1]
-	assert 'card' in args['json']
+	assert statuses['Email'] == 'failed'
+	assert statuses['PushPlus'] == 'not_configured'
+	assert statuses['Telegram'] == 'not_configured'
 
 
-@patch('requests.post')
-def test_send_wecom(mock_post, notification_kit):
-	notification_kit.send_wecom('测试标题', '测试内容')
+def test_push_message_marks_http_failure_as_failed(monkeypatch):
+	monkeypatch.setenv('PUSHPLUS_TOKEN', 'push-token')
+	response = MagicMock(status_code=500)
 
-	mock_post.assert_called_once_with(
-		'http://weixin.example.com', json={'msgtype': 'text', 'text': {'content': '测试标题\n测试内容'}}
-	)
+	with patch('utils.notify.curl_requests.post', return_value=response):
+		statuses = NotificationKit().push_message('subject', 'content')
 
-
-def test_missing_config():
-	os.environ.clear()
-	kit = NotificationKit()
-
-	with pytest.raises(ValueError, match='未配置邮箱信息'):
-		kit.send_email('测试', '测试')
-
-	with pytest.raises(ValueError, match='未配置PushPlus Token'):
-		kit.send_pushplus('测试', '测试')
+	assert statuses['PushPlus'] == 'failed'
 
 
-@patch('newapi.ai.notify.NotificationKit.send_email')
-@patch('newapi.ai.notify.NotificationKit.send_dingtalk')
-@patch('newapi.ai.notify.NotificationKit.send_wecom')
-@patch('newapi.ai.notify.NotificationKit.send_pushplus')
-@patch('newapi.ai.notify.NotificationKit.send_feishu')
-def test_push_message(mock_feishu, mock_pushplus, mock_wecom, mock_dingtalk, mock_email, notification_kit):
-	notification_kit.push_message('测试标题', '测试内容')
+def test_push_message_marks_non_json_http_response_as_failed(monkeypatch):
+	monkeypatch.setenv('PUSHPLUS_TOKEN', 'push-token')
+	response = MagicMock(status_code=200)
+	response.json.side_effect = ValueError
 
-	assert mock_email.called
-	assert mock_dingtalk.called
-	assert mock_wecom.called
-	assert mock_pushplus.called
-	assert mock_feishu.called
+	with patch('utils.notify.curl_requests.post', return_value=response):
+		statuses = NotificationKit().push_message('subject', 'content')
+
+	assert statuses['PushPlus'] == 'failed'
+
+
+def test_push_message_marks_non_object_json_response_as_failed(monkeypatch):
+	monkeypatch.setenv('PUSHPLUS_TOKEN', 'push-token')
+	response = MagicMock(status_code=200)
+	response.json.return_value = []
+
+	with patch('utils.notify.curl_requests.post', return_value=response):
+		statuses = NotificationKit().push_message('subject', 'content')
+
+	assert statuses['PushPlus'] == 'failed'

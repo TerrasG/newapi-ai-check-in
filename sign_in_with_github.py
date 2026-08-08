@@ -4,15 +4,17 @@
 """
 
 import json
-import os
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
-from utils.browser_utils import filter_cookies, take_screenshot, save_page_content_to_file
+
+from utils.browser_utils import filter_cookies, save_page_content_to_file, take_screenshot
 from utils.config import ProviderConfig
-from utils.wait_for_secrets import WaitForSecrets
 from utils.get_headers import get_browser_headers, print_browser_headers
 from utils.storage_state import ensure_storage_state_from_env
+from utils.wait_for_secrets import WaitForSecrets
 
 STORAGE_STATE_ENV_NAME = "STORATE_STATES_GITHUB"
 
@@ -61,9 +63,7 @@ class GitHubSignIn:
             - 浏览器指纹头部信息仅在检测到 Cloudflare 验证页面时返回
         """
         print(f"ℹ️ {self.account_name}: Executing sign-in with GitHub account")
-        print(
-            f"ℹ️ {self.account_name}: Using client_id: {client_id}, auth_state: {auth_state}, cache_file: {cache_file_path}"
-        )
+        print(f"ℹ️ {self.account_name}: Using GitHub OAuth session cache")
 
         async with AsyncCamoufox(
             # persistent_context=True,
@@ -84,7 +84,7 @@ class GitHubSignIn:
             )
 
             # 只有在缓存文件存在时才加载 storage_state
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
+            storage_state = cache_file_path if Path(cache_file_path).exists() else None  # noqa: ASYNC240
             if storage_state:
                 print(f"ℹ️ {self.account_name}: Found cache file, restore storage state")
             else:
@@ -110,7 +110,7 @@ class GitHubSignIn:
                     is_logged_in = False
                     oauth_url = f"https://github.com/login/oauth/authorize?response_type=code&client_id={client_id}&state={auth_state}&scope=user:email"
 
-                    if os.path.exists(cache_file_path):
+                    if Path(cache_file_path).exists():  # noqa: ASYNC240
                         try:
                             print(f"ℹ️ {self.account_name}: Checking login status at {oauth_url}")
                             # 直接访问授权页面检查是否已登录
@@ -208,7 +208,10 @@ class GitHubSignIn:
                                             otp_code = secrets["OTP"]
                                             print(f"✅ {self.account_name}: Retrieved OTP via wait-for-secrets")
                                     except Exception as e:
-                                        print(f"⚠️ {self.account_name}: wait-for-secrets failed: {e}")
+                                        print(
+                                            f"⚠️ {self.account_name}: wait-for-secrets failed: "
+                                            f"{type(e).__name__}"
+                                        )
 
                                     if otp_code:
                                         # 自动填充 OTP
@@ -334,7 +337,7 @@ class GitHubSignIn:
                             user_obj = json.loads(user_data)
                             api_user = user_obj.get("id")
                             if api_user:
-                                print(f"✅ {self.account_name}: Got api user: {api_user}")
+                                print(f"✅ {self.account_name}: Got api user")
                             else:
                                 print(f"⚠️ {self.account_name}: User id not found in localStorage")
                         else:
@@ -373,7 +376,7 @@ class GitHubSignIn:
 
                         # 如果 query 中包含 code，说明 OAuth 回调成功
                         if "code" in query_params:
-                            print(f"✅ {self.account_name}: OAuth code received: {query_params.get('code')}")
+                            print(f"✅ {self.account_name}: OAuth code received")
                             # 只有当检测到 Cloudflare 验证页面时，才获取并返回浏览器指纹头部信息
                             browser_headers = None
                             if cloudflare_challenge_detected:

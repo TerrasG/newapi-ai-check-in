@@ -1,208 +1,324 @@
 #!/usr/bin/env python3
-"""
-自动签到脚本
-"""
+"""自动签到入口。"""
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
+import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 from dotenv import load_dotenv
+
+from checkin import CheckIn
+from utils.balance_hash import load_balance_hash, save_balance_hash
 from utils.config import AppConfig
 from utils.notify import notify
-from utils.balance_hash import load_balance_hash, save_balance_hash
-from checkin import CheckIn
 
 load_dotenv(override=True)
 
 BALANCE_HASH_FILE = "balance_hash.txt"
+RESULT_FILE = Path("checkin-result.json")
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
+SUCCESS_TASK_STATUSES = {"success", "already_done"}
+PUBLIC_PROVIDER_NAMES = {"anyrouter", "huan666", "x666"}
+
+
+def _failed_provider_result(provider: str, error_code: str) -> dict:
+    """构造失败 Provider 的公开结果行。"""
+    return {
+        "provider": provider,
+        "auth_status": "failed",
+        "task_status": "failed",
+        "error_code": error_code,
+        "warnings": [],
+    }
 
 
 def generate_balance_hash(balances: dict) -> str:
-    """生成余额数据的hash"""
-    # 将包含 quota 和 used 的结构转换为 {account_name: [quota]} 格式用于 hash 计算
+    """生成不包含账号标识的余额变化哈希。"""
     simple_balances = {}
-    if balances:
-        for account_key, account_balances in balances.items():
-            quota_list = []
-            for _, balance_info in account_balances.items():
-                quota_list.append(balance_info["quota"])
-            simple_balances[account_key] = quota_list
+    for account_key, account_balances in balances.items():
+        simple_balances[account_key] = [
+            balance_info["quota"] for balance_info in account_balances.values()
+        ]
 
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(balance_json.encode("utf-8")).hexdigest()[:16]
 
 
-async def main():
-    """运行签到流程
+def _error_code(message: str | None) -> str | None:
+    """把自由文本错误压缩成可公开的稳定错误码。"""
+    if not message:
+        return None
 
-    Returns:
-            退出码: 0 表示至少有一个账号成功, 1 表示全部失败
-    """
+    normalized = message.lower()
+    mappings = (
+        ("no_valid_accounts", ("no valid accounts",)),
+        ("auth_refresh_required", ("refresh storate_states_linuxdo", "session is expired")),
+        ("authentication_failed", ("authentication", "oauth", "log-in", "login")),
+        ("provider_task_failed", ("provider task", "spin failed", "topup failed", "failed to get cdk")),
+        ("user_info_failed", ("user info",)),
+        ("http_error", ("http ",)),
+        ("invalid_response", ("invalid response", "response type")),
+        ("timeout", ("timeout",)),
+        ("configuration", ("configuration", "configured", "provider")),
+    )
+    for code, needles in mappings:
+        if any(needle in normalized for needle in needles):
+            return code
 
-    print("🚀 newapi.ai multi-account auto check-in script started (using Camoufox)")
-    print(f'🕒 Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    return "unknown_error"
+
+
+def _provider_result(
+    provider: str,
+    results: list[tuple[str, bool, dict | None]],
+) -> tuple[dict, dict]:
+    """汇总单个 Provider 的认证和业务任务结果。"""
+    successful_methods = []
+    failed_methods = []
+    balances = {}
+    successful_task_statuses = set()
+    task_error_code = None
+    authentication_error_code = None
+
+    for auth_method, auth_succeeded, user_info in results:
+        if auth_succeeded and user_info and user_info.get("success"):
+            successful_methods.append(auth_method)
+            method_task_status = user_info.get("task_status", "success")
+            if method_task_status in SUCCESS_TASK_STATUSES:
+                successful_task_statuses.add(method_task_status)
+            else:
+                task_error_code = _error_code(user_info.get("error")) or "provider_task_failed"
+            balances[auth_method] = {
+                "quota": user_info.get("quota", 0),
+                "used": user_info.get("used_quota", 0),
+                "bonus": user_info.get("bonus_quota", 0),
+            }
+        else:
+            failed_methods.append(auth_method)
+            authentication_error_code = (
+                _error_code(user_info.get("error") if user_info else None) or "authentication_failed"
+            )
+
+    provider_success = bool(successful_task_statuses)
+    task_status = "success" if "success" in successful_task_statuses else "already_done"
+    error_code = None
+    if not provider_success:
+        task_status = "failed"
+        error_code = task_error_code if successful_methods else authentication_error_code
+        error_code = error_code or "no_authentication_result"
+    result = {
+        "provider": provider,
+        "auth_status": "success" if successful_methods else "failed",
+        "task_status": task_status if provider_success else "failed",
+        "error_code": None if provider_success else error_code,
+        "warnings": (
+            ["some_authentication_methods_failed"]
+            if successful_methods and failed_methods
+            else []
+        ),
+    }
+    return result, balances
+
+
+def _render_summary(run_result: dict, notification_status: dict | None = None) -> str:
+    """生成日志、邮件和 GitHub Job Summary 共用的 Markdown。"""
+    status_label = "✅ 成功" if run_result["status"] == "success" else "❌ 失败"
+    lines = [
+        "# 自动签到结果",
+        "",
+        f"- 总体状态：{status_label}",
+        f"- 执行时间：{run_result['generated_at']}",
+        "",
+        "| Provider | 认证 | 任务 | 错误码 |",
+        "| --- | --- | --- | --- |",
+    ]
+
+    for provider in run_result["providers"]:
+        lines.append(
+            "| {provider} | {auth} | {task} | {error} |".format(
+                provider=provider["provider"],
+                auth=provider["auth_status"],
+                task=provider["task_status"],
+                error=provider["error_code"] or "-",
+            )
+        )
+
+    if run_result["configuration_errors"]:
+        lines.extend(["", "## 配置错误", ""])
+        lines.extend(f"- `{_error_code(error) or 'configuration_error'}`" for error in run_result["configuration_errors"])
+
+    if notification_status is not None:
+        email_status = notification_status.get("Email", "not_configured")
+        lines.extend(["", f"- 邮件通知：`{email_status}`"])
+
+    return "\n".join(lines)
+
+
+def _redact_run_result(run_result: dict) -> dict:
+    """只保留可公开的运行结果字段。"""
+    redacted_result = dict(run_result)
+    redacted_result["required_providers"] = [
+        provider if provider in PUBLIC_PROVIDER_NAMES else "custom_provider"
+        for provider in run_result["required_providers"]
+    ]
+    redacted_result["providers"] = [
+        {
+            **provider_result,
+            "provider": (
+                provider_result["provider"]
+                if provider_result["provider"] in PUBLIC_PROVIDER_NAMES
+                else "custom_provider"
+            ),
+        }
+        for provider_result in run_result["providers"]
+    ]
+    redacted_result["configuration_errors"] = [
+        _error_code(error) or "configuration_error"
+        for error in run_result["configuration_errors"]
+    ]
+    return redacted_result
+
+
+def _write_outputs(run_result: dict, notification_status: dict | None = None) -> None:
+    redacted_result = _redact_run_result(run_result)
+    RESULT_FILE.write_text(
+        json.dumps(redacted_result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    summary = _render_summary(redacted_result, notification_status)
+    print(summary)
+
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as summary_file:
+            summary_file.write(summary)
+            summary_file.write("\n")
+
+
+async def main() -> int:
+    """运行签到流程；所有必需 Provider 成功时返回 0。"""
+    generated_at = datetime.now(CHINA_TIMEZONE).isoformat(timespec="seconds")
+    print("🚀 newapi.ai multi-account auto check-in script started")
+    print(f"🕒 Execution time: {generated_at}")
 
     app_config = AppConfig.load_from_env()
     print(f"⚙️ Loaded {len(app_config.providers)} provider(s)")
-
-    # 检查账号配置
-    if not app_config.accounts:
-        print("❌ Unable to load account configuration, program exits")
-        return 1
-    
     print(f"⚙️ Found {len(app_config.accounts)} account(s)")
 
-    # 加载余额hash
+    run_result = {
+        "status": "failed",
+        "generated_at": generated_at,
+        "required_providers": app_config.required_providers,
+        "providers": [
+            _failed_provider_result(provider, "configuration_error")
+            for provider in app_config.required_providers
+        ],
+        "configuration_errors": list(app_config.configuration_errors),
+    }
+
+    if not app_config.accounts:
+        run_result["configuration_errors"].append("No valid accounts were loaded")
+
+    if run_result["configuration_errors"]:
+        notification_payload = _redact_run_result(run_result)
+        notification_status = notify.push_message(
+            "Check-in failed",
+            _render_summary(notification_payload),
+            msg_type="text",
+        )
+        _write_outputs(run_result, notification_status)
+        return 1
+
     last_balance_hash = load_balance_hash(BALANCE_HASH_FILE)
-
-    # 为每个账号执行签到
-    success_count = 0
-    total_count = 0
-    notification_content = []
     current_balances = {}
-    need_notify = False  # 是否需要发送通知
+    provider_results = {}
 
-    for i, account_config in enumerate(app_config.accounts):
-        account_key = f"account_{i + 1}"
-        account_name = account_config.get_display_name(i)
-        if len(notification_content) > 0:
-            notification_content.append("\n-------------------------------")
+    for index, account_config in enumerate(app_config.accounts):
+        account_name = account_config.get_display_name(index)
+        provider_name = account_config.provider
 
         try:
-            provider_config = app_config.get_provider(account_config.provider)
+            provider_config = app_config.get_provider(provider_name)
             if not provider_config:
-                print(f"❌ {account_name}: Provider '{account_config.provider}' configuration not found")
-                need_notify = True
-                notification_content.append(
-                    f"[FAIL] {account_name}: Provider '{account_config.provider}' configuration not found"
+                provider_result = _failed_provider_result(
+                    provider_name,
+                    "provider_not_configured",
                 )
-                continue
+                balances = {}
+            else:
+                print(f"🌀 Processing {account_name} using provider '{provider_name}'")
+                checkin = CheckIn(
+                    account_name,
+                    account_config,
+                    provider_config,
+                    global_proxy=app_config.global_proxy,
+                )
+                provider_result, balances = _provider_result(provider_name, await checkin.execute())
+        except Exception as exc:
+            print(f"❌ {provider_name}: processing exception: {type(exc).__name__}")
+            provider_result = _failed_provider_result(
+                provider_name,
+                _error_code(type(exc).__name__) or "processing_exception",
+            )
+            balances = {}
 
-            print(f"🌀 Processing {account_name} using provider '{account_config.provider}'")
-            checkin = CheckIn(account_name, account_config, provider_config, global_proxy=app_config.global_proxy)
-            results = await checkin.execute()
+        provider_results[provider_name] = provider_result
+        if balances:
+            current_balances[provider_name] = balances
 
-            total_count += len(results)
+    ordered_providers = app_config.required_providers or list(provider_results)
+    run_result["providers"] = [
+        provider_results.get(
+            provider,
+            _failed_provider_result(provider, "required_provider_missing"),
+        )
+        for provider in ordered_providers
+    ]
 
-            # 处理多个认证方式的结果
-            account_success = False
-            successful_methods = []
-            failed_methods = []
+    required_success = all(
+        provider["task_status"] in SUCCESS_TASK_STATUSES
+        for provider in run_result["providers"]
+    )
+    run_result["status"] = "success" if required_success else "failed"
 
-            this_account_balances = {}
-            # 构建详细的结果报告
-            account_result = f"📣 {account_name} Summary:\n"
-            for auth_method, success, user_info in results:
-                status = "✅ SUCCESS" if success else "❌ FAILED"
-                account_result += f"  {status} with {auth_method} authentication\n"
-
-                if success and user_info and user_info.get("success"):
-                    account_success = True
-                    success_count += 1
-                    successful_methods.append(auth_method)
-                    account_result += f"    💰 {user_info['display']}\n"
-                    # 记录余额信息
-                    current_quota = user_info["quota"]
-                    current_used = user_info["used_quota"]
-                    current_bonus = user_info["bonus_quota"]
-                    this_account_balances[f"{auth_method}"] = {
-                        "quota": current_quota,
-                        "used": current_used,
-                        "bonus": current_bonus,
-                    }
-                else:
-                    failed_methods.append(auth_method)
-                    error_msg = user_info.get("error", "Unknown error") if user_info else "Unknown error"
-                    account_result += f"    🔺 {str(error_msg)}\n"
-
-            if account_success:
-                current_balances[account_key] = this_account_balances
-
-            # 如果所有认证方式都失败，需要通知
-            if not account_success and results:
-                need_notify = True
-                print(f"🔔 {account_name} all authentication methods failed, will send notification")
-
-            # 如果有失败的认证方式，也通知
-            if failed_methods and successful_methods:
-                need_notify = True
-                print(f"🔔 {account_name} has some failed authentication methods, will send notification")
-
-            # 添加统计信息
-            success_count_methods = len(successful_methods)
-            failed_count_methods = len(failed_methods)
-
-            account_result += f"\n📊 Statistics: {success_count_methods}/{len(results)} methods successful"
-            if failed_count_methods > 0:
-                account_result += f" ({failed_count_methods} failed)"
-
-            notification_content.append(account_result)
-
-        except Exception as e:
-            print(f"❌ {account_name} processing exception: {e}")
-            need_notify = True  # 异常也需要通知
-            notification_content.append(f"❌ {account_name} Exception: {str(e)[:100]}...")
-
-    # 检查余额变化
     current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
-    print(f"\n\nℹ️ Current balance hash: {current_balance_hash}, Last balance hash: {last_balance_hash}")
-    if current_balance_hash:
-        if last_balance_hash is None:
-            # 首次运行
-            need_notify = True
-            print("🔔 First run detected, will send notification with current balances")
-        elif current_balance_hash != last_balance_hash:
-            # 余额有变化
-            need_notify = True
-            print("🔔 Balance changes detected, will send notification")
-        else:
-            print("ℹ️ No balance changes detected")
-
-    # 保存当前余额hash
+    balance_changed = current_balance_hash is not None and current_balance_hash != last_balance_hash
     if current_balance_hash:
         save_balance_hash(BALANCE_HASH_FILE, current_balance_hash)
 
-    if need_notify and notification_content:
-        # 构建通知内容
-        summary = [
-            "-------------------------------",
-            "📢 Check-in result statistics:",
-            f"🔵 Success: {success_count}/{total_count}",
-            f"🔴 Failed: {total_count - success_count}/{total_count}",
-        ]
+    should_notify = not required_success or balance_changed or last_balance_hash is None
+    notification_status = None
+    if should_notify:
+        email_subject = (
+            "Check-in succeeded"
+            if required_success
+            else "Check-in failed"
+        )
+        notification_status = notify.push_message(
+            email_subject,
+            _render_summary(_redact_run_result(run_result)),
+            msg_type="text",
+        )
 
-        if success_count == total_count:
-            summary.append("✅ All accounts check-in successful!")
-        elif success_count > 0:
-            summary.append("⚠️ Some accounts check-in successful")
-        else:
-            summary.append("❌ All accounts check-in failed")
-
-        time_info = f'🕓 Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-
-        notify_content = "\n\n".join([time_info, "\n".join(notification_content), "\n".join(summary)])
-
-        print(notify_content)
-        notify.push_message("Check-in Alert", notify_content, msg_type="text")
-        print("🔔 Notification sent due to failures or balance changes")
-    else:
-        print("ℹ️ All accounts successful and no balance changes detected, notification skipped")
-
-    # 设置退出码
-    sys.exit(0 if success_count > 0 else 1)
+    _write_outputs(run_result, notification_status)
+    return 0 if required_success else 1
 
 
-def run_main():
-    """运行主函数的包装函数"""
+def run_main() -> None:
     try:
-        asyncio.run(main())
+        sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
         print("\n⚠️ Program interrupted by user")
         sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Error occurred during program execution: {e}")
+    except Exception as exc:
+        print(f"\n❌ Program execution failed: {type(exc).__name__}")
         sys.exit(1)
 
 

@@ -5,16 +5,16 @@
 
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generator, AsyncGenerator, List, Literal
+from typing import AsyncGenerator, Callable, Dict, Generator, List, Literal
 
-from utils.get_check_in_status import newapi_check_in_status
 from utils.get_cdk import (
     get_runawaytime_cdk,
     get_x666_cdk,
     # get_b4u_cdk,
 )
-
+from utils.get_check_in_status import newapi_check_in_status
 
 # 前向声明 AccountConfig 类型，用于类型注解
 # 实际的 AccountConfig 类在后面定义
@@ -314,6 +314,8 @@ class AppConfig:
     linux_do_accounts: List["OAuthAccountConfig"] = field(default_factory=list)  # 全局 Linux.do 账号列表
     github_accounts: List["OAuthAccountConfig"] = field(default_factory=list)  # 全局 GitHub 账号列表
     global_proxy: Dict | None = None
+    required_providers: List[str] = field(default_factory=list)
+    configuration_errors: List[str] = field(default_factory=list)
 
     @classmethod
     def _parse_site_config(
@@ -372,6 +374,8 @@ class AppConfig:
         linux_do_accounts_env: str = "ACCOUNTS_LINUX_DO",
         github_accounts_env: str = "ACCOUNTS_GITHUB",
         proxy_env: str = "PROXY",
+        required_providers_env: str = "REQUIRED_PROVIDERS",
+        auto_add_required_providers_env: str = "AUTO_ADD_REQUIRED_PROVIDERS",
     ) -> "AppConfig":
         """从环境变量加载配置
 
@@ -382,15 +386,30 @@ class AppConfig:
             github_accounts_env: GitHub 账号配置的环境变量名称，默认为 "ACCOUNTS_GITHUB"
             proxy_env: 全局代理配置的环境变量名称，默认为 "PROXY"
         """
-        # 加载 providers 配置
-        providers = cls._load_providers(providers_env)
+        required_providers, configuration_errors = cls._load_provider_list(required_providers_env)
+        auto_add_required_providers, auto_add_errors = cls._load_provider_list(
+            auto_add_required_providers_env
+        )
+        configuration_errors.extend(auto_add_errors)
+        invalid_auto_add = sorted(set(auto_add_required_providers) - set(required_providers))
+        if invalid_auto_add:
+            configuration_errors.append(
+                "Auto-add providers must also be required: " + ", ".join(invalid_auto_add)
+            )
+
+        # 加载 providers 配置。必需 Provider 使用仓库内置配置，避免旧 Secret 静默覆盖。
+        providers = cls._load_providers(providers_env, protected_names=set(required_providers))
 
         # 加载全局 OAuth 账号配置
         linux_do_accounts = cls._load_oauth_accounts(linux_do_accounts_env, "Linux.do")
         github_accounts = cls._load_oauth_accounts(github_accounts_env, "GitHub")
 
         # 加载账号配置（传入全局 OAuth 账号用于解析 bool 类型配置）
-        accounts = cls._load_accounts(accounts_env, linux_do_accounts, github_accounts)
+        accounts, declared_account_providers = cls._load_accounts(
+            accounts_env,
+            linux_do_accounts,
+            github_accounts,
+        )
 
         # 自动为自定义 provider 添加账号（如果 accounts 中没有对应的 provider）
         accounts = cls._auto_add_accounts_for_custom_providers(providers, accounts, linux_do_accounts, github_accounts)
@@ -398,13 +417,117 @@ class AppConfig:
         # 加载全局代理配置
         global_proxy = cls._load_proxy(proxy_env)
 
-        return cls(
+        app_config = cls(
             providers=providers,
             accounts=accounts,
             linux_do_accounts=linux_do_accounts,
             github_accounts=github_accounts,
             global_proxy=global_proxy,
+            required_providers=required_providers,
+            configuration_errors=configuration_errors,
         )
+        app_config._validate_account_declarations(declared_account_providers)
+        app_config._ensure_required_provider_accounts(set(auto_add_required_providers))
+        return app_config
+
+    @classmethod
+    def _load_provider_list(cls, env_name: str) -> tuple[List[str], List[str]]:
+        """加载逗号分隔的 Provider 名称列表。"""
+        raw_value = os.getenv(env_name, "")
+        if not raw_value.strip():
+            return [], []
+
+        providers = [item.strip().lower() for item in raw_value.split(",") if item.strip()]
+        errors = []
+        duplicate_names = sorted({name for name in providers if providers.count(name) > 1})
+        if duplicate_names:
+            errors.append(f"Duplicate providers in {env_name}: {', '.join(duplicate_names)}")
+
+        # 保持声明顺序，避免结果表每次抖动。
+        return list(dict.fromkeys(providers)), errors
+
+    def _ensure_required_provider_accounts(
+        self,
+        auto_add_providers: set[str],
+    ) -> None:
+        """确保必需 Provider 各有且只有一个账号配置。"""
+        for provider_name in self.required_providers:
+            provider_config = self.providers.get(provider_name)
+            if not provider_config:
+                self.configuration_errors.append(
+                    f"Required provider is not configured: {provider_name}"
+                )
+                continue
+
+            matching_accounts = [
+                account for account in self.accounts if account.provider == provider_name
+            ]
+            if len(matching_accounts) > 1:
+                duplicate_error = f"Required provider has duplicate accounts: {provider_name}"
+                if duplicate_error not in self.configuration_errors:
+                    self.configuration_errors.append(duplicate_error)
+                continue
+
+            if matching_accounts:
+                continue
+
+            if provider_name not in auto_add_providers:
+                self.configuration_errors.append(
+                    f"Required provider account is missing: {provider_name}"
+                )
+                continue
+
+            linux_do_accounts = (
+                self.linux_do_accounts.copy()
+                if provider_config.linuxdo_client_id and self.linux_do_accounts
+                else None
+            )
+            github_accounts = (
+                self.github_accounts.copy()
+                if provider_config.github_client_id and self.github_accounts
+                else None
+            )
+
+            if not linux_do_accounts and not github_accounts:
+                self.configuration_errors.append(
+                    f"Auto-added provider has no usable global OAuth account: {provider_name}"
+                )
+                continue
+
+            self.accounts.append(
+                AccountConfig.from_dict(
+                    {
+                        "provider": provider_name,
+                        "name": provider_name,
+                    },
+                    linux_do_accounts,
+                    github_accounts,
+                )
+            )
+            auth_name = "Linux.do" if linux_do_accounts else "GitHub"
+            print(f"✅ Auto-added required provider '{provider_name}' with {auth_name} authentication")
+
+    def _validate_account_declarations(self, declared_providers: List[str]) -> None:
+        """验证原始账号声明，避免无效账号在解析阶段被静默忽略。"""
+        declaration_counts = Counter(declared_providers)
+        valid_provider_counts = Counter(account.provider for account in self.accounts)
+
+        for provider_name in dict.fromkeys(declared_providers):
+            if provider_name not in self.providers:
+                self.configuration_errors.append(
+                    f"Unknown provider in ACCOUNTS: {provider_name}"
+                )
+
+        for provider_name in self.required_providers:
+            declaration_count = declaration_counts[provider_name]
+            if declaration_count > 1:
+                self.configuration_errors.append(
+                    f"Required provider has duplicate accounts: {provider_name}"
+                )
+            if declaration_count > valid_provider_counts.get(provider_name, 0):
+                self.configuration_errors.append(
+                    f"Required provider account has invalid credentials: {provider_name}"
+                )
 
     @classmethod
     def _auto_add_accounts_for_custom_providers(
@@ -505,7 +628,11 @@ class AppConfig:
             return proxy
 
     @classmethod
-    def _load_providers(cls, providers_env: str) -> Dict[str, ProviderConfig]:
+    def _load_providers(
+        cls,
+        providers_env: str,
+        protected_names: set[str] | None = None,
+    ) -> Dict[str, ProviderConfig]:
         """从环境变量加载 providers 配置
 
         Args:
@@ -849,8 +976,13 @@ class AppConfig:
                     print(f"⚠️ {providers_env} must be a JSON object, ignoring custom providers")
                     return providers
 
-                # 解析自定义 providers,会覆盖默认配置
+                protected_names = protected_names or set()
+
+                # 解析自定义 providers。必需 Provider 保持内置配置，不允许 Secret 静默覆盖。
                 for name, provider_data in providers_data.items():
+                    if name.lower() in protected_names:
+                        print(f"⚠️ Ignoring custom override for required provider '{name}'")
+                        continue
                     try:
                         providers[name] = ProviderConfig.from_dict(name, provider_data, is_customize=True)
                     except Exception as e:
@@ -996,7 +1128,7 @@ class AppConfig:
         accounts_env: str,
         global_linux_do_accounts: List["OAuthAccountConfig"],
         global_github_accounts: List["OAuthAccountConfig"],
-    ) -> List["AccountConfig"]:
+    ) -> tuple[List["AccountConfig"], List[str]]:
         """从环境变量加载多账号配置
 
         Args:
@@ -1006,14 +1138,14 @@ class AppConfig:
             global_github_accounts: 全局 GitHub 账号列表
 
         Returns:
-            账号配置列表，如果加载失败则返回空列表
+            有效账号配置列表和原始账号声明的 Provider 列表
         """
         # 从环境变量获取账号配置
         accounts_str = os.getenv(accounts_env)
 
         if not accounts_str:
             print(f"⚠️ {accounts_env} environment variable not found")
-            return []
+            return [], []
 
         try:
             accounts_data = json.loads(accounts_str)
@@ -1021,14 +1153,22 @@ class AppConfig:
             # 检查是否为数组格式
             if not isinstance(accounts_data, list):
                 print("❌ Account configuration must use array format [{}]")
-                return []
+                return [], []
 
             accounts = []
+            declared_providers = []
             # 验证账号数据格式
             for i, account in enumerate(accounts_data):
                 if not isinstance(account, dict):
                     print(f"⚠️ Account {i + 1} configuration format is incorrect, skipping")
                     continue
+
+                provider_name = account.get("provider", "anyrouter")
+                if not isinstance(provider_name, str) or not provider_name:
+                    declared_providers.append(str(provider_name))
+                    print(f"⚠️ Account {i + 1} provider must be a non-empty string, skipping")
+                    continue
+                declared_providers.append(provider_name)
 
                 # 如果有 name 字段,确保它不是空字符串
                 if "name" in account and not account["name"]:
@@ -1120,13 +1260,13 @@ class AppConfig:
                 )
                 accounts.append(account_config)
 
-            return accounts
+            return accounts, declared_providers
         except json.JSONDecodeError as e:
             print(f"❌ Account configuration JSON format is incorrect: {e}")
-            return []
+            return [], []
         except Exception as e:
             print(f"❌ Account configuration format is incorrect: {e}")
-            return []
+            return [], []
 
     def get_provider(self, name: str) -> ProviderConfig | None:
         """获取指定 provider 配置"""
