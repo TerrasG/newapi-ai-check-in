@@ -4,8 +4,8 @@
 用途：让服务器经 Tailscale 访问本机 Clash 代理（不改 Clash 配置）。
 支持 HTTP 明文代理 和 HTTP CONNECT 隧道（HTTPS/任意 TCP）。
 """
-import socketserver
 import socket
+import socketserver
 import threading
 
 LISTEN = ('0.0.0.0', 7898)
@@ -51,8 +51,10 @@ class Handler(socketserver.BaseRequestHandler):
                 # 双向泵（残余数据 + 后续流量）
                 t1 = threading.Thread(target=pump, args=(client, up, 'c2u'), daemon=True)
                 t2 = threading.Thread(target=pump, args=(up, client, 'u2c'), daemon=True)
-                t1.start(); t2.start()
-                t1.join(); t2.join()
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
                 up.close()
                 return
 
@@ -61,8 +63,10 @@ class Handler(socketserver.BaseRequestHandler):
             up.sendall(first)
             t1 = threading.Thread(target=pump, args=(client, up, 'c2u'), daemon=True)
             t2 = threading.Thread(target=pump, args=(up, client, 'u2c'), daemon=True)
-            t1.start(); t2.start()
-            t1.join(); t2.join()
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
             up.close()
         except Exception as e:
             print(f'[proxy] error: {e}')

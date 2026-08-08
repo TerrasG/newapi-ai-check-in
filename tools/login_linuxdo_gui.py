@@ -13,12 +13,11 @@
 """
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 
-from camoufox.async_api import AsyncCamoufox
 from camoufox import DefaultAddons
+from camoufox.async_api import AsyncCamoufox
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "storage-states"
@@ -66,7 +65,7 @@ async def main() -> int:
         if not logged_in:
             # 兜底：即使没检测到，也让用户确认
             print("未自动检测到登录成功。如果你已登录，请按回车确认...")
-            input()
+            input()  # noqa: ASYNC250 - 登录引导脚本专用，阻塞等待用户确认
             logged_in = True
 
         print("登录成功！保存 storage state ...")
