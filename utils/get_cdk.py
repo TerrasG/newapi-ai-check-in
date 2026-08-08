@@ -418,6 +418,22 @@ async def _get_x666_user_token(
                     except Exception:
                         pass
 
+                # up.x666.me 的 token 实际存在 HttpOnly cookie `auth_token`（JWT），
+                # localStorage 读不到（HttpOnly），这里从 cookie 兜底读取。
+                if not user_token:
+                    try:
+                        cookies = await context.cookies()
+                        auth_token = next(
+                            (c["value"] for c in cookies
+                             if c["name"] == "auth_token" and "up.x666.me" in c.get("domain", "")),
+                            None,
+                        )
+                        if auth_token:
+                            user_token = auth_token
+                            print(f"✅ {account_name}: Got userToken from auth_token cookie")
+                    except Exception as exc:
+                        print(f"⚠️ {account_name}: Failed to read auth_token cookie: {type(exc).__name__}")
+
                 if user_token:
                     # 保存 storage_state 用于下次缓存
                     await context.storage_state(path=cache_file_path)
