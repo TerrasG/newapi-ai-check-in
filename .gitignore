@@ -26,3 +26,8 @@ opencode.json
 
 # Git Worktree
 .worktree/
+
+# Ralph runtime artifacts and build metadata
+*.egg-info/
+scripts/ralph/
+*.log
